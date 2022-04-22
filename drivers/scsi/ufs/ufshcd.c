@@ -220,6 +220,7 @@ static void ufshcd_update_uic_error_cnt(struct ufs_hba *hba, u32 reg, int type)
 /* UIC command timeout, unit: ms */
 #define UIC_CMD_TIMEOUT	500
 
+#define UIC_MI_CMD_TIMEOUT	3000
 /* NOP OUT retries waiting for NOP IN response */
 #define NOP_OUT_RETRIES    10
 /* Timeout after 30 msecs if NOP OUT hangs without response */
@@ -1755,7 +1756,7 @@ out:
 
 static int ufshcd_clock_scaling_prepare(struct ufs_hba *hba)
 {
-	#define DOORBELL_CLR_TOUT_US		(1000 * 1000) /* 1 sec */
+	#define DOORBELL_CLR_TOUT_US		(2000 * 1000) /* 2 sec */
 	int ret = 0;
 	/*
 	 * make sure that there are no outstanding requests when
@@ -2591,19 +2592,19 @@ static ssize_t ufshcd_clkgate_enable_store(struct device *dev,
 		return -EINVAL;
 
 	value = !!value;
+
+	spin_lock_irqsave(hba->host->host_lock, flags);
 	if (value == hba->clk_gating.is_enabled)
 		goto out;
 
-	if (value) {
-		ufshcd_release(hba, false);
-	} else {
-		spin_lock_irqsave(hba->host->host_lock, flags);
+	if (value)
+		hba->clk_gating.active_reqs--;
+	else
 		hba->clk_gating.active_reqs++;
-		spin_unlock_irqrestore(hba->host->host_lock, flags);
-	}
 
 	hba->clk_gating.is_enabled = value;
 out:
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
 	return count;
 }
 
@@ -3181,6 +3182,20 @@ static void ufshcd_clk_scaling_update_busy(struct ufs_hba *hba)
 static inline
 int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
 {
+	if (hba->lrb[task_tag].cmd) {
+		u8 opcode = (u8)(*hba->lrb[task_tag].cmd->cmnd);
+
+		if (opcode == SECURITY_PROTOCOL_OUT && hba->security_in) {
+			hba->security_in--;
+		} else if (opcode == SECURITY_PROTOCOL_IN) {
+			if (hba->security_in) {
+				WARN_ON(1);
+				return -EINVAL;
+			}
+			hba->security_in++;
+		}
+	}
+
 	hba->lrb[task_tag].issue_time_stamp = ktime_get();
 	hba->lrb[task_tag].compl_time_stamp = ktime_set(0, 0);
 	ufshcd_cond_add_cmd_trace(hba, task_tag,
@@ -4033,7 +4048,13 @@ send_orig_cmd:
 		ufshcd_release_all(hba);
 		dev_err(hba->dev, "%s: failed sending command, %d\n",
 							__func__, err);
-		err = DID_ERROR;
+		if (err == -EINVAL) {
+			set_host_byte(cmd, DID_ERROR);
+			if (has_read_lock)
+				ufshcd_put_read_lock(hba);
+			cmd->scsi_done(cmd);
+			return 0;
+		}
 		goto out;
 	}
 
@@ -5373,7 +5394,7 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 more_wait:
 	if (!oops_in_progress) {
 		if (!wait_for_completion_timeout(hba->uic_async_done,
-						msecs_to_jiffies(UIC_CMD_TIMEOUT))) {
+						msecs_to_jiffies(UIC_MI_CMD_TIMEOUT))) {
 			u32 intr_status = 0;
 			s64 ts_since_last_intr;
 
@@ -7157,10 +7178,8 @@ static bool ufshcd_wb_sup(struct ufs_hba *hba)
 	return false;
 #endif
 #endif
-	return ((hba->dev_info.d_ext_ufs_feature_sup &
-		   UFS_DEV_WRITE_BOOSTER_SUP) &&
-		  (hba->dev_info.b_wb_buffer_type
-		   || hba->dev_info.wb_config_lun));
+	return !!(hba->dev_info.d_ext_ufs_feature_sup &
+		  UFS_DEV_WRITE_BOOSTER_SUP);
 }
 
 static int ufshcd_wb_ctrl(struct ufs_hba *hba, bool enable)
@@ -8743,7 +8762,7 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 {
 	int err;
 	size_t buff_len;
-	u8 model_index, lun;
+	u8 model_index;
 	u8 *desc_buf;
 	u32 d_lu_wb_buf_alloc;
 
@@ -8773,12 +8792,11 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 	model_index = desc_buf[DEVICE_DESC_PARAM_PRDCT_NAME];
 
 
-	/* Enable WB only for UFS-3.1 or UFS-2.2 OR if desc len >= 0x59 */
-/*	if ((dev_desc->wspecversion >= 0x310) ||
-	    (dev_desc->wspecversion == 0x220) ||
+	/* Enable WB only for UFS-3.1 OR if desc len >= 0x59 */
+	if ((dev_desc->wspecversion >= 0x310) ||
 	    (dev_desc->wmanufacturerid == UFS_VENDOR_TOSHIBA &&
 	     dev_desc->wspecversion >= 0x300 &&
-	     hba->desc_size.dev_desc >= 0x59)) {
+	     hba->desc_size.dev_desc >= 0x59))
 		hba->dev_info.d_ext_ufs_feature_sup =
 			desc_buf[DEVICE_DESC_PARAM_EXT_UFS_FEATURE_SUP]
 								<< 24 |
@@ -8788,32 +8806,6 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 								<< 8 |
 			desc_buf[DEVICE_DESC_PARAM_EXT_UFS_FEATURE_SUP + 3];
 
-		hba->dev_info.b_wb_buffer_type =
-			desc_buf[DEVICE_DESC_PARAM_WB_TYPE];
-
-		if (hba->dev_info.b_wb_buffer_type)
-			goto skip_unit_desc;
-
-		hba->dev_info.wb_config_lun = false;
-		for (lun = 0; lun < UFS_UPIU_MAX_GENERAL_LUN; lun++) {
-			d_lu_wb_buf_alloc = 0;
-			err = ufshcd_read_unit_desc_param(hba,
-					lun,
-					UNIT_DESC_PARAM_WB_BUF_ALLOC_UNITS,
-					(u8 *)&d_lu_wb_buf_alloc,
-					sizeof(d_lu_wb_buf_alloc));
-
-			if (err)
-				break;
-
-			if (d_lu_wb_buf_alloc) {
-				hba->dev_info.wb_config_lun = true;
-				break;
-			}
-		}
-	}*/
-
-//skip_unit_desc:
 	/* Zero-pad entire buffer for string termination. */
 	memset(desc_buf, 0, buff_len);
 
@@ -10715,7 +10707,10 @@ static int ufshcd_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	      && !hba->wb_buf_flush_enabled) ||
 	     !ufshcd_is_runtime_pm(pm_op))) {
 		/* ensure that bkops is disabled */
-		ufshcd_disable_auto_bkops(hba);
+		ret = ufshcd_disable_auto_bkops(hba);
+		if (ret)
+			goto enable_gating;
+
 		ret = ufshcd_set_dev_pwr_mode(hba, req_dev_pwr_mode);
 		if (ret)
 			goto enable_gating;
@@ -11535,6 +11530,8 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	ufsdbg_add_debugfs(hba);
 
 	ufs_sysfs_add_nodes(hba->dev);
+
+	device_enable_async_suspend(dev);
 
 	return 0;
 

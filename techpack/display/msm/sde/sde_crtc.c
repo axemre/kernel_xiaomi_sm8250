@@ -44,6 +44,11 @@
 #include "xiaomi_frame_stat.h"
 #include "dsi_display.h"
 
+#ifdef CONFIG_DRM_SDE_EXPO
+#include "dsi_display.h"
+#include "dsi_panel.h"
+#endif
+
 #define SDE_PSTATES_MAX (SDE_STAGE_MAX * 4)
 #define SDE_MULTIRECT_PLANE_MAX (SDE_STAGE_MAX * 2)
 #define IDLE_TIMEOUT_DEFAULT (1100)
@@ -1171,6 +1176,9 @@ static int pstate_cmp(const void *a, const void *b)
 	int rc = 0;
 	int pa_zpos, pb_zpos;
 
+	if ((!pa || !pa->sde_pstate) || (!pb || !pb->sde_pstate))
+		return rc;
+
 	pa_zpos = sde_plane_get_property(pa->sde_pstate, PLANE_PROP_ZPOS);
 	pb_zpos = sde_plane_get_property(pb->sde_pstate, PLANE_PROP_ZPOS);
 
@@ -1456,6 +1464,12 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 		if (cstate->fod_dim_layer)
 			_sde_crtc_setup_dim_layer_cfg(crtc, sde_crtc,
 					mixer, cstate->fod_dim_layer);
+#ifdef CONFIG_DRM_SDE_EXPO
+		if (cstate->exposure_dim_layer) {
+			_sde_crtc_setup_dim_layer_cfg(crtc, sde_crtc,
+					mixer, cstate->exposure_dim_layer);
+		}
+#endif
 	}
 
 	_sde_crtc_program_lm_output_roi(crtc);
@@ -2135,12 +2149,12 @@ static void sde_crtc_frame_event_cb(void *data, u32 event)
 	SDE_DEBUG("crtc%d\n", crtc->base.id);
 	SDE_EVT32_VERBOSE(DRMID(crtc), event);
 
-	spin_lock_irqsave(&sde_crtc->spin_lock, flags);
+	spin_lock_irqsave(&sde_crtc->fevent_spin_lock, flags);
 	fevent = list_first_entry_or_null(&sde_crtc->frame_event_list,
 			struct sde_crtc_frame_event, list);
 	if (fevent)
 		list_del_init(&fevent->list);
-	spin_unlock_irqrestore(&sde_crtc->spin_lock, flags);
+	spin_unlock_irqrestore(&sde_crtc->fevent_spin_lock, flags);
 
 	if (!fevent) {
 		SDE_ERROR("crtc%d event %d overflow\n",
@@ -2425,9 +2439,9 @@ static void sde_crtc_frame_event_work(struct kthread_work *work)
 		SDE_ERROR("crtc%d ts:%lld received panel dead event\n",
 				crtc->base.id, ktime_to_ns(fevent->ts));
 
-	spin_lock_irqsave(&sde_crtc->spin_lock, flags);
+	spin_lock_irqsave(&sde_crtc->fevent_spin_lock, flags);
 	list_add_tail(&fevent->list, &sde_crtc->frame_event_list);
-	spin_unlock_irqrestore(&sde_crtc->spin_lock, flags);
+	spin_unlock_irqrestore(&sde_crtc->fevent_spin_lock, flags);
 	SDE_ATRACE_END("crtc_frame_event");
 }
 
@@ -2558,6 +2572,53 @@ static void _sde_crtc_set_dim_layer_v1(struct drm_crtc *crtc,
 				dim_layer[i].color_fill.color_3);
 	}
 }
+
+#ifdef CONFIG_DRM_SDE_EXPO
+static int sde_crtc_config_exposure_dim_layer(struct drm_crtc_state *crtc_state, int stage)
+{
+	struct sde_kms *kms;
+	struct sde_hw_dim_layer *dim_layer;
+	struct sde_crtc_state *cstate = to_sde_crtc_state(crtc_state);
+	struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	int alpha = sde_crtc_get_property(cstate, CRTC_PROP_DIM_LAYER_EXPO);
+	struct dsi_display *dsi_display = get_main_display();
+	struct dsi_panel *panel = dsi_display->panel;
+
+	kms = _sde_crtc_get_kms(crtc_state->crtc);
+	if (!kms || !kms->catalog) {
+		return -EINVAL;
+	}
+
+	if (cstate->num_dim_layers == SDE_MAX_DIM_LAYERS - 1) {
+		pr_err("failed to get available dim layer for exposure\n");
+		return -EINVAL;
+	}
+
+	if (!alpha || panel->doze_enabled) {
+		cstate->exposure_dim_layer = NULL;
+		return 0;
+	}
+
+	if ((stage + SDE_STAGE_0) >= kms->catalog->mixer[0].sblk->maxblendstages) {
+		return -EINVAL;
+	}
+
+	dim_layer = &cstate->dim_layer[cstate->num_dim_layers];
+	dim_layer->flags = SDE_DRM_DIM_LAYER_INCLUSIVE;
+	dim_layer->stage = stage + SDE_STAGE_0;
+
+	dim_layer->rect.x = 0;
+	dim_layer->rect.y = 0;
+	dim_layer->rect.w = mode->hdisplay;
+	dim_layer->rect.h = mode->vdisplay;
+	dim_layer->color_fill = (struct sde_mdss_color) {0, 0, 0, alpha};
+	cstate->exposure_dim_layer = dim_layer;
+
+	dim_layer->flags = SDE_CRTC_DIRTY_DIM_LAYER_EXPO;
+
+	return 0;
+}
+#endif
 
 /**
  * _sde_crtc_set_dest_scaler - copy dest scaler settings from userspace
@@ -3344,7 +3405,8 @@ static void sde_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 
 	/* schedule the idle notify delayed work */
-	if (idle_time && sde_encoder_check_curr_mode(
+	if (idle_time
+		&& sde_encoder_check_curr_mode(
 						sde_crtc->mixers[0].encoder,
 						MSM_DISPLAY_VIDEO_MODE)) {
 		kthread_queue_delayed_work(&event_thread->worker,
@@ -4725,6 +4787,34 @@ static int _sde_crtc_check_get_pstates(struct drm_crtc *crtc,
 	return rc;
 }
 
+#ifdef CONFIG_DRM_SDE_EXPO
+static int sde_crtc_exposure_atomic_check(struct sde_crtc_state *cstate,
+		struct plane_state *pstates, int cnt)
+{
+	int i, zpos = 0;
+	struct dsi_display *dsi_display = get_main_display();
+	struct dsi_panel *panel = dsi_display->panel;
+
+	if (!panel->dimlayer_exposure || panel->doze_enabled) {
+		cstate->exposure_dim_layer = NULL;
+		return 0;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		if (pstates[i].stage > zpos)
+			zpos = pstates[i].stage;
+	}
+	zpos++;
+
+	if (sde_crtc_config_exposure_dim_layer(&cstate->base, zpos)) {
+		SDE_ERROR("Failed to config dim layer\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#endif
+
 static int _sde_crtc_check_zpos(struct drm_crtc_state *state,
 		struct sde_crtc *sde_crtc,
 		struct plane_state *pstates,
@@ -4832,6 +4922,12 @@ static int _sde_crtc_atomic_check_pstates(struct drm_crtc *crtc,
 #endif
 
 	sde_crtc_fod_atomic_check(cstate, pstates, cnt);
+
+#ifdef CONFIG_DRM_SDE_EXPO
+	rc = sde_crtc_exposure_atomic_check(cstate, pstates, cnt);
+	if (rc)
+		return rc;
+#endif
 
 	/* assign mixer stages based on sorted zpos property */
 	rc = _sde_crtc_check_zpos(state, sde_crtc, pstates, cstate, mode, cnt);
@@ -5242,6 +5338,11 @@ static void sde_crtc_install_properties(struct drm_crtc *crtc,
 
 	msm_property_install_volatile_range(&sde_crtc->property_info,
 		"output_fence", 0x0, 0, ~0, 0, CRTC_PROP_OUTPUT_FENCE);
+
+#ifdef CONFIG_DRM_SDE_EXPO
+        msm_property_install_volatile_range(&sde_crtc->property_info,
+                        "dim_layer_exposure", 0x0, 0, ~0, 0, CRTC_PROP_DIM_LAYER_EXPO);
+#endif
 
 	msm_property_install_range(&sde_crtc->property_info,
 			"output_fence_offset", 0x0, 0, 1, 0,
@@ -6460,6 +6561,7 @@ struct drm_crtc *sde_crtc_init(struct drm_device *dev, struct drm_plane *plane)
 
 	mutex_init(&sde_crtc->crtc_lock);
 	spin_lock_init(&sde_crtc->spin_lock);
+	spin_lock_init(&sde_crtc->fevent_spin_lock);
 	atomic_set(&sde_crtc->frame_pending, 0);
 	mutex_init(&sde_crtc->vblank_modeset_ctrl_lock);
 

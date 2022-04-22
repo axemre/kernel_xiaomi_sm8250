@@ -89,8 +89,6 @@ struct cpuidle_state;
 
 #define CPU_NR		8
 
-#define TASK_BITS (PID_MAX_DEFAULT + BITS_PER_LONG)
-
 extern __read_mostly bool sched_predl;
 extern unsigned int sched_capacity_margin_up[CPU_NR];
 extern unsigned int sched_capacity_margin_down[CPU_NR];
@@ -109,7 +107,6 @@ struct walt_sched_stats {
 	int nr_big_tasks;
 	u64 cumulative_runnable_avg_scaled;
 	u64 pred_demands_sum_scaled;
-	unsigned int nr_rtg_high_prio_tasks;
 };
 
 struct group_cpu_time {
@@ -278,6 +275,8 @@ static inline int task_has_dl_policy(struct task_struct *p)
  * SUGOV stands for SchedUtil GOVernor.
  */
 #define SCHED_FLAG_SUGOV	0x10000000
+
+#define SCHED_DL_FLAGS (SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN | SCHED_FLAG_SUGOV)
 
 static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
 {
@@ -1100,6 +1099,7 @@ struct rq {
 	call_single_data_t	hrtick_csd;
 #endif
 	struct hrtimer		hrtick_timer;
+	ktime_t 		hrtick_time;
 #endif
 
 #ifdef CONFIG_SCHEDSTATS
@@ -2139,7 +2139,7 @@ unsigned long arch_scale_freq_capacity(int cpu)
 #ifndef arch_scale_max_freq_capacity
 struct sched_domain;
 static __always_inline
-unsigned long arch_scale_max_freq_capacity(struct sched_domain *sd, int cpu)
+unsigned long arch_scale_max_freq_capacity(int cpu)
 {
 	return SCHED_CAPACITY_SCALE;
 }
@@ -2214,8 +2214,9 @@ static inline unsigned long __cpu_util(int cpu)
 	unsigned int util;
 
 #ifdef CONFIG_SCHED_WALT
-	u64 walt_cpu_util =
-		cpu_rq(cpu)->walt_stats.cumulative_runnable_avg_scaled;
+	if (!walt_disabled && sysctl_sched_use_walt_cpu_util) {
+		u64 walt_cpu_util =
+			cpu_rq(cpu)->walt_stats.cumulative_runnable_avg_scaled;
 
 	return min_t(unsigned long, walt_cpu_util, capacity_orig_of(cpu));
 #endif
@@ -2231,12 +2232,15 @@ static inline unsigned long __cpu_util(int cpu)
 
 static inline unsigned long cpu_util_cum(int cpu, int delta)
 {
-	u64 util = cpu_rq(cpu)->cfs.avg.util_avg;
 	unsigned long capacity = capacity_orig_of(cpu);
+	u64 util;
 
 #ifdef CONFIG_SCHED_WALT
-	util = cpu_rq(cpu)->cum_window_demand_scaled;
+	util = cpu_util(cpu);
+#else
+	util = __cpu_util(cpu);
 #endif
+
 	delta += util;
 	if (delta < 0)
 		return 0;
@@ -2790,12 +2794,6 @@ enum sched_boost_policy {
 
 #ifdef CONFIG_SCHED_WALT
 
-#define WALT_MANY_WAKEUP_DEFAULT 1000
-static inline bool walt_want_remote_wakeup(void)
-{
-	return sysctl_sched_many_wakeup_threshold < WALT_MANY_WAKEUP_DEFAULT;
-}
-
 static inline int cluster_first_cpu(struct sched_cluster *cluster)
 {
 	return cpumask_first(&cluster->cpus);
@@ -2935,18 +2933,6 @@ static inline
 struct related_thread_group *task_related_thread_group(struct task_struct *p)
 {
 	return rcu_dereference(p->grp);
-}
-
-static inline bool task_rtg_high_prio(struct task_struct *p)
-{
-	return task_in_related_thread_group(p) &&
-		(p->prio <= sysctl_walt_rtg_cfs_boost_prio);
-}
-
-static inline bool walt_low_latency_task(struct task_struct *p)
-{
-	return p->low_latency &&
-		(task_util(p) < sysctl_walt_low_latency_task_threshold);
 }
 
 /* Is frequency of two cpus synchronized with each other? */
@@ -3206,11 +3192,6 @@ struct related_thread_group *task_related_thread_group(struct task_struct *p)
 	return NULL;
 }
 
-static inline bool task_rtg_high_prio(struct task_struct *p)
-{
-	return false;
-}
-
 static inline u32 task_load(struct task_struct *p) { return 0; }
 static inline u32 task_pl(struct task_struct *p) { return 0; }
 
@@ -3257,10 +3238,6 @@ static inline bool early_detection_notify(struct rq *rq, u64 wallclock)
 }
 
 static inline void note_task_waking(struct task_struct *p, u64 wallclock) { }
-static inline bool walt_want_remote_wakeup(void)
-{
-	return false;
-}
 #endif	/* CONFIG_SCHED_WALT */
 
 struct sched_avg_stats {

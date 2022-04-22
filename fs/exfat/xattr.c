@@ -5,17 +5,16 @@
  *  xattr.c: exFAT code for supporting xattr(Extended File Attributes)
  */
 
-#include "exfat_fs.h"
-
-#ifdef CONFIG_EXFAT_VIRTUAL_XATTR
-
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/xattr.h>
 #include <linux/dcache.h>
 
+#include "exfat_raw.h"
+#include "exfat_fs.h"
+
 #ifndef CONFIG_EXFAT_VIRTUAL_XATTR_SELINUX_LABEL
-#define CONFIG_EXFAT_VIRTUAL_XATTR_SELINUX_LABEL	("undefined")
+#define CONFIG_EXFAT_VIRTUAL_XATTR_SELINUX_LABEL	("u:object_r:exfat:s0")
 #endif
 
 static const char default_xattr[] = CONFIG_EXFAT_VIRTUAL_XATTR_SELINUX_LABEL;
@@ -76,5 +75,3 @@ const struct xattr_handler *exfat_xattr_handlers[] = {
 	&exfat_xattr_handler,
 	NULL
 };
-
-#endif /* CONFIG_EXFAT_VIRTUAL_XATTR */

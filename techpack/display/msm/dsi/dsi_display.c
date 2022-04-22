@@ -22,6 +22,10 @@
 #include "sde_dbg.h"
 #include "dsi_parser.h"
 
+#ifdef CONFIG_DRM_SDE_EXPO
+#include "sde_expo_dim_layer.h"
+#endif
+
 #define to_dsi_display(x) container_of(x, struct dsi_display, host)
 #define INT_BASE_10 10
 
@@ -235,6 +239,14 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 		       dsi_display->name, rc);
 		goto error;
 	}
+
+#ifdef CONFIG_DRM_SDE_EXPO
+	if(panel->dimlayer_exposure) {
+		if (bl_lvl && !panel->doze_enabled) {
+			bl_temp = expo_map_dim_level((u32)bl_temp, dsi_display);
+		}
+	}
+#endif
 
 	rc = dsi_panel_set_backlight(panel, (u32)bl_temp);
 	if (rc)
@@ -1090,8 +1102,11 @@ int dsi_display_set_power(struct drm_connector *connector,
 		mi_cfg->in_aod = true;
 		mi_drm_notifier_call_chain(MI_DRM_EARLY_EVENT_BLANK, &notify_data);
 		rc = dsi_panel_set_lp2(display->panel);
-		if (mi_cfg->unset_doze_brightness)
-			dsi_panel_set_doze_brightness(display->panel,
+		if (mi_cfg->last_bl_level>70)
+			mi_cfg->unset_doze_brightness=DOZE_BRIGHTNESS_HBM;
+		else
+			mi_cfg->unset_doze_brightness=DOZE_BRIGHTNESS_LBM;
+		dsi_panel_set_doze_brightness(display->panel,
 				mi_cfg->unset_doze_brightness, true);
 		mi_drm_notifier_call_chain(MI_DRM_EVENT_BLANK, &notify_data);
 		break;
@@ -5128,6 +5143,113 @@ static struct attribute_group dynamic_dsi_clock_fs_attrs_group = {
 	.attrs = dynamic_dsi_clock_fs_attrs,
 };
 
+static ssize_t sysfs_doze_status_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	status = panel->doze_enabled;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_doze_status_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+	int rc = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_status(panel, status);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
+static ssize_t sysfs_doze_mode_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	enum dsi_doze_mode_type doze_mode;
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	doze_mode = panel->doze_mode;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", doze_mode);
+}
+
+static ssize_t sysfs_doze_mode_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	int rc = 0;
+	int mode;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtoint(buf, 10, &mode);
+	if (rc) {
+		pr_err("%s: kstrtoint failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	if (mode < DSI_DOZE_LPM || mode > DSI_DOZE_HBM) {
+		pr_err("%s: invalid value for doze mode\n", __func__);
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_mode(panel, (enum dsi_doze_mode_type) mode);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
 static ssize_t sysfs_fod_ui_read(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
@@ -5200,6 +5322,67 @@ error:
 	return ret == 0 ? count : ret;
 }
 
+#ifdef CONFIG_DRM_SDE_EXPO
+static ssize_t sysfs_dimlayer_exposure_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	status = panel->dimlayer_exposure;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_dimlayer_exposure_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	struct drm_connector *connector;
+	bool status;
+	int rc = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	panel = display->panel;
+
+	panel->dimlayer_exposure = status;
+	dsi_display_set_backlight(connector, display, panel->bl_config.bl_level);
+
+	return count;
+}
+#endif
+
+static DEVICE_ATTR(doze_status, 0644,
+                        sysfs_doze_status_read,
+                        sysfs_doze_status_write);
+
+static DEVICE_ATTR(doze_mode, 0644,
+                        sysfs_doze_mode_read,
+                        sysfs_doze_mode_write);
+
 static DEVICE_ATTR(fod_ui, 0444,
 			sysfs_fod_ui_read,
 			NULL);
@@ -5208,9 +5391,20 @@ static DEVICE_ATTR(hbm, 0644,
                         sysfs_hbm_read,
                         sysfs_hbm_write);
 
+#ifdef CONFIG_DRM_SDE_EXPO
+static DEVICE_ATTR(dimlayer_exposure, 0644,
+			sysfs_dimlayer_exposure_read,
+			sysfs_dimlayer_exposure_write);
+#endif
+
 static struct attribute *display_fs_attrs[] = {
+	&dev_attr_doze_status.attr,
+	&dev_attr_doze_mode.attr,
 	&dev_attr_fod_ui.attr,
 	&dev_attr_hbm.attr,
+#ifdef CONFIG_DRM_SDE_EXPO
+	&dev_attr_dimlayer_exposure.attr,
+#endif
 	NULL,
 };
 static struct attribute_group display_fs_attrs_group = {
@@ -5330,6 +5524,8 @@ static int dsi_display_bind(struct device *dev,
 		DSI_ERR("[%s] sysfs init failed, rc=%d\n", display->name, rc);
 		goto error;
 	}
+
+	atomic_set(&display->fod_ui, false);
 
 	memset(&info, 0x0, sizeof(info));
 
@@ -5674,7 +5870,6 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 	display->panel_node = panel_node;
 	display->pdev = pdev;
 	display->boot_disp = boot_disp;
-	display->is_prim_display = true;
 
 	dsi_display_parse_cmdline_topology(display, index);
 

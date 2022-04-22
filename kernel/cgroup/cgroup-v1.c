@@ -545,7 +545,6 @@ static ssize_t __cgroup1_procs_write(struct kernfs_open_file *of,
 		!memcmp(of->kn->parent->name, "top-app", sizeof("top-app")) &&
 		is_zygote_pid(task->parent->pid)) {
 		devfreq_boost_kick_max(DEVFREQ_MSM_LLCCBW_DDR, 500);
-		devfreq_boost_kick_max(DEVFREQ_MSM_CPU_LLCCBW, 500);
 	}
 
 out_finish:
@@ -846,6 +845,10 @@ static int cgroup1_rename(struct kernfs_node *kn, struct kernfs_node *new_parent
 {
 	struct cgroup *cgrp = kn->priv;
 	int ret;
+
+	/* do not accept '\n' to prevent making /proc/<pid>/cgroup unparsable */
+	if (strchr(new_name_str, '\n'))
+		return -EINVAL;
 
 	if (kernfs_type(kn) != KERNFS_DIR)
 		return -ENOTDIR;

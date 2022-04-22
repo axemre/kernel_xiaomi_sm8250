@@ -74,9 +74,6 @@ struct msm_gem_vma;
 
 #define TEARDOWN_DEADLOCK_RETRY_MAX 5
 
-extern atomic_t resume_pending;
-extern wait_queue_head_t resume_wait_q;
-
 struct msm_file_private {
 	rwlock_t queuelock;
 	struct list_head submitqueues;
@@ -171,6 +168,9 @@ enum msm_mdp_crtc_property {
 	CRTC_PROP_IDLE_PC_STATE,
 	CRCT_PROP_MI_FOD_SYNC_INFO,
 
+#ifdef CONFIG_DRM_SDE_EXPO
+	CRTC_PROP_DIM_LAYER_EXPO,
+#endif
 	/* total # of properties */
 	CRTC_PROP_COUNT
 };

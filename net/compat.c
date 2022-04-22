@@ -158,7 +158,7 @@ int cmsghdr_from_user_compat_to_kern(struct msghdr *kmsg, struct sock *sk,
 	if (kcmlen > stackbuf_size)
 		kcmsg_base = kcmsg = sock_kmalloc(sk, kcmlen, GFP_KERNEL);
 	if (kcmsg == NULL)
-		return -ENOBUFS;
+		return -ENOMEM;
 
 	/* Now copy them over neatly. */
 	memset(kcmsg, 0, kcmlen);
@@ -845,7 +845,7 @@ COMPAT_SYSCALL_DEFINE5(recvmmsg, int, fd, struct compat_mmsghdr __user *, mmsg,
 
 COMPAT_SYSCALL_DEFINE2(socketcall, int, call, u32 __user *, args)
 {
-	u32 a[AUDITSC_ARGS];
+	u32 a[AUDITSC_ARGS] = { 0 };
 	unsigned int len;
 	u32 a0, a1;
 	int ret;

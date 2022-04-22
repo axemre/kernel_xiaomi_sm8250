@@ -68,7 +68,7 @@ __cfg80211_wdev_from_attrs(struct net *netns, struct nlattr **attrs)
 	struct wireless_dev *result = NULL;
 	bool have_ifidx = attrs[NL80211_ATTR_IFINDEX];
 	bool have_wdev_id = attrs[NL80211_ATTR_WDEV];
-	u64 wdev_id;
+	u64 wdev_id = 0;
 	int wiphy_idx = -1;
 	int ifidx = -1;
 
@@ -3756,9 +3756,6 @@ static int nl80211_del_key(struct sk_buff *skb, struct genl_info *info)
 	if (err)
 		return err;
 
-	if (key.idx < 0)
-		return -EINVAL;
-
 	if (info->attrs[NL80211_ATTR_MAC])
 		mac_addr = nla_data(info->attrs[NL80211_ATTR_MAC]);
 
@@ -3772,6 +3769,10 @@ static int nl80211_del_key(struct sk_buff *skb, struct genl_info *info)
 	/* for now */
 	if (key.type != NL80211_KEYTYPE_PAIRWISE &&
 	    key.type != NL80211_KEYTYPE_GROUP)
+		return -EINVAL;
+
+	if (!cfg80211_valid_key_idx(rdev, key.idx,
+				    key.type == NL80211_KEYTYPE_PAIRWISE))
 		return -EINVAL;
 
 	if (!rdev->ops->del_key)

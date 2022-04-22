@@ -1014,6 +1014,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->pmd_huge_pte = NULL;
 #endif
 	mm_init_uprobes_state(mm);
+	hugetlb_count_init(mm);
 
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
@@ -2384,7 +2385,6 @@ long _do_fork(unsigned long clone_flags,
 	/* Boost CPU to the max for 150 ms when userspace launches an app */
 	if (is_zygote_pid(current->pid)) {
 		devfreq_boost_kick_max(DEVFREQ_MSM_LLCCBW_DDR, 150);
-		devfreq_boost_kick_max(DEVFREQ_MSM_CPU_LLCCBW, 150);
 	}
 
 	/*

@@ -289,6 +289,7 @@ struct sde_encoder_virt {
 	struct kthread_work touch_notify_work;
 	struct kthread_work esd_trigger_work;
 	struct input_handler *input_handler;
+	bool input_handler_registered;
 	struct msm_display_topology topology;
 	bool vblank_enabled;
 	bool idle_pc_restore;
@@ -737,6 +738,7 @@ void sde_encoder_destroy(struct drm_encoder *drm_enc)
 
 	kfree(sde_enc->input_handler);
 	sde_enc->input_handler = NULL;
+	sde_enc->input_handler_registered = false;
 
 	kfree(sde_enc);
 }
@@ -2320,7 +2322,6 @@ static int _sde_encoder_rc_kickoff(struct drm_encoder *drm_enc,
 
 	if (is_vid_mode && sde_enc->rc_state == SDE_ENC_RC_STATE_IDLE) {
 		_sde_encoder_irq_control(drm_enc, true);
-		sde_kms_update_pm_qos_irq_request(sde_kms, true, false);
 	} else {
 		/* enable all the clks and resources */
 		ret = _sde_encoder_resource_control_helper(drm_enc,
@@ -2636,7 +2637,6 @@ static int _sde_encoder_rc_idle(struct drm_encoder *drm_enc,
 
 	if (is_vid_mode) {
 		_sde_encoder_irq_control(drm_enc, false);
-		sde_kms_update_pm_qos_irq_request(sde_kms, false, false);
 	} else {
 		/* disable all the clks and resources */
 		_sde_encoder_update_rsc_client(drm_enc, false);
@@ -3168,6 +3168,7 @@ static int _sde_encoder_input_handler(
 	input_handler->id_table = sde_input_ids;
 
 	sde_enc->input_handler = input_handler;
+	sde_enc->input_handler_registered = false;
 
 	return rc;
 }
@@ -3324,7 +3325,18 @@ static void sde_encoder_virt_enable(struct drm_encoder *drm_enc)
 		return;
 	}
 
-	_sde_encoder_input_handler_register(drm_enc);
+	/* register input handler if not already registered */
+	if (sde_enc->input_handler && !sde_enc->input_handler_registered &&
+			!msm_is_mode_seamless_dms(cur_mode) &&
+		sde_encoder_check_curr_mode(drm_enc, MSM_DISPLAY_CMD_MODE) &&
+			!msm_is_mode_seamless_dyn_clk(cur_mode)) {
+		_sde_encoder_input_handler_register(drm_enc);
+		if (!sde_enc->input_handler || !sde_enc->input_handler->private)
+			SDE_ERROR(
+			"input handler registration failed, rc = %d\n", ret);
+		else
+			sde_enc->input_handler_registered = true;
+	}
 
 	if ((drm_enc->crtc && drm_enc->crtc->state &&
 			drm_enc->crtc->state->connectors_changed &&
@@ -3427,7 +3439,11 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 	/* wait for idle */
 	sde_encoder_wait_for_event(drm_enc, MSM_ENC_TX_COMPLETE);
 
-	_sde_encoder_input_handler_unregister(drm_enc);
+	if (sde_enc->input_handler && sde_enc->input_handler_registered &&
+		sde_encoder_check_curr_mode(drm_enc, MSM_DISPLAY_CMD_MODE)) {
+		input_unregister_handler(sde_enc->input_handler);
+		sde_enc->input_handler_registered = false;
+	}
 
 	/*
 	 * For primary command mode and video mode encoders, execute the
@@ -4534,7 +4550,7 @@ static void sde_encoder_touch_notify_work_handler(struct kthread_work *work)
 	if (c_bridge)
 		dsi_display = c_bridge->display;
 
-	if (dsi_display && dsi_display->is_prim_display && dsi_display->panel
+	if (dsi_display && dsi_display->panel
 		&& dsi_display->panel->mi_cfg.smart_fps_restore) {
 		if (dsi_display->panel->mi_cfg.smart_fps_support && fm_stat.enabled) {
 			calc_fps(0, (int)true);
@@ -4977,32 +4993,6 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error)
 	}
 
 	SDE_ATRACE_END("encoder_kickoff");
-}
-
-void sde_encoder_helper_get_pp_line_count(struct drm_encoder *drm_enc,
-			struct sde_hw_pp_vsync_info *info)
-{
-	struct sde_encoder_virt *sde_enc;
-	struct sde_encoder_phys *phys;
-	int i, ret;
-
-	if (!drm_enc || !info)
-		return;
-
-	sde_enc = to_sde_encoder_virt(drm_enc);
-
-	for (i = 0; i < sde_enc->num_phys_encs; i++) {
-		phys = sde_enc->phys_encs[i];
-		if (phys && phys->hw_intf && phys->hw_pp
-				&& phys->hw_intf->ops.get_vsync_info) {
-			ret = phys->hw_intf->ops.get_vsync_info(
-						phys->hw_intf, &info[i]);
-			if (!ret) {
-				info[i].pp_idx = phys->hw_pp->idx - PINGPONG_0;
-				info[i].intf_idx = phys->hw_intf->idx - INTF_0;
-			}
-		}
-	}
 }
 
 int sde_encoder_helper_reset_mixers(struct sde_encoder_phys *phys_enc,

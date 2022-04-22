@@ -1004,11 +1004,15 @@ irq_forced_thread_fn(struct irq_desc *desc, struct irqaction *action)
 	irqreturn_t ret;
 
 	local_bh_disable();
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT_BASE))
+		local_irq_disable();
 	ret = action->thread_fn(action->irq, action->dev_id);
 	if (ret == IRQ_HANDLED)
 		atomic_inc(&desc->threads_handled);
 
 	irq_finalize_oneshot(desc, action);
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT_BASE))
+		local_irq_enable();
 	local_bh_enable();
 	return ret;
 }
@@ -1265,12 +1269,14 @@ static void affine_one_perf_thread(struct irqaction *action)
 	if (!action->thread)
 		return;
 
-	if (action->flags & IRQF_PERF_AFFINE)
+	if (action->flags & IRQF_PERF_AFFINE) {
 		mask = cpu_perf_mask;
-	else
+		action->thread->pc_flags |= PC_PERF_AFFINE;
+	} else {
 		mask = cpu_prime_mask;
+		action->thread->pc_flags |= PC_PRIME_AFFINE;
+	}
 
-	action->thread->flags |= PF_PERF_CRITICAL;
 	set_cpus_allowed_ptr(action->thread, mask);
 }
 
@@ -1279,7 +1285,8 @@ static void unaffine_one_perf_thread(struct irqaction *action)
 	if (!action->thread)
 		return;
 
-	action->thread->flags &= ~PF_PERF_CRITICAL;
+	action->thread->pc_flags &= ~PC_PERF_AFFINE;
+	action->thread->pc_flags &= ~PC_PRIME_AFFINE;
 	set_cpus_allowed_ptr(action->thread, cpu_all_mask);
 }
 
